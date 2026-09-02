@@ -4,6 +4,8 @@ import ipywidgets as widgets
 from matplotlib.colors import ListedColormap
 from IPython.display import display, clear_output
 from typing import Optional, Tuple
+import torch
+from calc import gaussian_quad
 
 from calc import ThicknessCalculator, fit_batch_profile_gpu
 
