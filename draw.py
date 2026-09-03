@@ -92,6 +92,8 @@ class ThicknessViewer:
         ydim, xdim = tmap.shape
         extent = [0, xdim * pix, 0, ydim * pix]
 
+        data = getattr(self.calc, field, None)
+        assert data is not None, f"Field '{field}' not found."
         # determine masks
         mask = None
         if getattr(self.calc, 'fitting_mask', None) is not None:
