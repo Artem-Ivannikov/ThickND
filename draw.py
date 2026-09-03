@@ -92,8 +92,6 @@ class ThicknessViewer:
         ydim, xdim = tmap.shape
         extent = [0, xdim * pix, 0, ydim * pix]
 
-        data = getattr(self.calc, field, None)
-        assert data is not None, f"Field '{field}' not found."
         # determine masks
         mask = None
         if getattr(self.calc, 'fitting_mask', None) is not None:
@@ -106,7 +104,7 @@ class ThicknessViewer:
         valid = mask & (tmap >= 0) if mask is not None else (tmap >= 0)
         #fail = mask & (tmap < 0) if mask is not None else np.zeros_like(tmap, bool)
         #outside = mask is not None and ~mask or np.zeros_like(tmap, bool)
-        outside = (~mask) if mask is not None else np.zeros_like(data, bool)
+        outside = (~mask) if mask is not None else np.zeros_like(tmap, bool)
 
         fig, ax = plt.subplots(figsize=(8, 6))
         # background
