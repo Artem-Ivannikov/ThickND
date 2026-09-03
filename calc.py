@@ -56,6 +56,86 @@ def gaussian_quad_jac(x: np.ndarray,
         db
     ])  # (N,13)
 
+def theta_to_phi(theta, pixel_size, i0):
+    """
+    Convert 13 raw theta parameters (absolute Å, unitless fractions) to
+    13 phi parameters (pixel‑relative means, pixel sigmas, unitless amplitudes).
+
+    Works for both torch.Tensor (batched) and np.ndarray (single vector).
+    The last dimension must have size 13.
+
+    Parameters
+    ----------
+    theta : torch.Tensor or np.ndarray
+        Shape (..., 13). Parameter order:
+        [m0_ang, d0_ang, d1_frac, d2_frac, s1_ang, s2_ang,
+         fs3, fs4, A1, A2, fA3, fA4, bias]
+    pixel_size : float
+        Voxel size in Å.
+    i0 : int
+        Starting pixel index of the extracted profile segment.
+
+    Returns
+    -------
+    phi : same type and shape as theta
+        Last dimension size 13, order:
+        [m1_px, sigma1_px, A1, m2_px, sigma2_px, A2,
+         m3_px, sigma3_px, A3, m4_px, sigma4_px, A4, bias]
+    """
+    # Unpack parameters (works for both torch and numpy via indexing)
+    m0_ang   = theta[..., 0]
+    d0_ang   = theta[..., 1]
+    d1_frac  = theta[..., 2]
+    d2_frac  = theta[..., 3]
+    s1_ang   = theta[..., 4]
+    s2_ang   = theta[..., 5]
+    fs3      = theta[..., 6]
+    fs4      = theta[..., 7]
+    A1       = theta[..., 8]
+    A2       = theta[..., 9]
+    fA3      = theta[..., 10]
+    fA4      = theta[..., 11]
+    bias     = theta[..., 12]
+
+    # Convert distances and means to pixel units
+    inv_px = 1.0 / float(pixel_size)
+    m0_px = m0_ang * inv_px - float(i0)
+    delta0_px = d0_ang * inv_px
+    delta1_px = delta0_px * d1_frac
+    delta2_px = delta0_px * d2_frac
+    sigma1_px = s1_ang * inv_px
+    sigma2_px = s2_ang * inv_px
+    sigma3_px = sigma1_px * fs3
+    sigma4_px = sigma2_px * fs4
+
+    # Compute the four Gaussian means
+    m1_px = m0_px - delta0_px
+    m2_px = m0_px + delta0_px
+    m3_px = m1_px + delta1_px
+    m4_px = m2_px - delta2_px
+
+    # Amplitudes of satellite Gaussians
+    A3 = A1 * fA3
+    A4 = A2 * fA4
+
+    # Stack appropriately depending on input type
+    if isinstance(theta, np.ndarray):
+        return np.stack([
+            m1_px, sigma1_px, A1,
+            m2_px, sigma2_px, A2,
+            m3_px, sigma3_px, A3,
+            m4_px, sigma4_px, A4,
+            bias
+        ], axis=-1)
+    else:  # torch.Tensor
+        return torch.stack([
+            m1_px, sigma1_px, A1,
+            m2_px, sigma2_px, A2,
+            m3_px, sigma3_px, A3,
+            m4_px, sigma4_px, A4,
+            bias
+        ], dim=-1)
+
 class BatchedQuadGaussianModel(nn.Module):
     def __init__(self, batch_size: int,
                  lb: np.ndarray, ub: np.ndarray,
@@ -70,33 +150,20 @@ class BatchedQuadGaussianModel(nn.Module):
         self.pixel_size = pixel_size
 
     def forward(self, x: torch.Tensor):
-        # x: (B, L)  *in pixel indices*
-        theta = self.lb + (self.ub - self.lb) * torch.sigmoid(self.raw)  # (B,13) in Å for means/deltas/sigmas
+        # x: (B, L) in pixel indices
+        theta = self.lb + (self.ub - self.lb) * torch.sigmoid(self.raw)  # (B,13)
+        phi = theta_to_phi(theta, self.pixel_size, self.i0)              # (B,13)
 
-        # unpack (all in Å or unitless for amps/bias)
-        m0_ang, d0_ang, d1_frac, d2_frac, s1_ang, s2_ang, fs3, fs4, A1, A2, fA3, fA4, b = torch.unbind(theta, dim=1)
+        # Unpack phi parameters (all in pixel units or unitless)
+        m1_px, sigma1_px, A1, m2_px, sigma2_px, A2, m3_px, sigma3_px, A3, m4_px, sigma4_px, A4, bias = (
+            phi[..., 0], phi[..., 1], phi[..., 2],
+            phi[..., 3], phi[..., 4], phi[..., 5],
+            phi[..., 6], phi[..., 7], phi[..., 8],
+            phi[..., 9], phi[..., 10], phi[..., 11],
+            phi[..., 12]
+        )
 
-        # convert the *physical* parameters to pixel units for fitting:
-        m0_px    = m0_ang / self.pixel_size - self.i0   # center relative to i0
-        delta0_px= d0_ang / self.pixel_size
-        delta1_px= delta0_px * d1_frac
-        delta2_px= delta0_px * d2_frac
-        sigma1_px= s1_ang / self.pixel_size
-        sigma2_px= s2_ang / self.pixel_size
-        sigma3_px= sigma1_px * fs3         # fraction of σ1
-        sigma4_px= sigma2_px * fs4         # fraction of σ2
-
-        # now reconstruct the four means in pixel units:
-        m1_px = m0_px - delta0_px
-        m2_px = m0_px + delta0_px
-        m3_px = m1_px + delta1_px
-        m4_px = m2_px - delta2_px
-
-        # amps remain unitless:
-        A3 = A1 * fA3   
-        A4 = A2 * fA4
- 
-        # now we can do (x - mean_px)/sigma_px safely in pixel space:
+        # Compute the four Gaussians
         xp = x.unsqueeze(2)  # (B,L,1)
         def G(m, s, A):
             z = (xp - m.unsqueeze(-1).unsqueeze(-1)) / s.unsqueeze(-1).unsqueeze(-1)
@@ -106,7 +173,8 @@ class BatchedQuadGaussianModel(nn.Module):
         g2 = G(m2_px, sigma2_px, A2)
         g3 = G(m3_px, sigma3_px, A3)
         g4 = G(m4_px, sigma4_px, A4)
-        return (g1 + g2 + g3 + g4 + b.unsqueeze(-1).unsqueeze(-1)).squeeze(2)  # (B,L)
+        return (g1 + g2 + g3 + g4 + bias.unsqueeze(-1).unsqueeze(-1)).squeeze(2)  # (B,L)
+
 
 def fit_batch_profile_gpu(
     segments: np.ndarray,          # (B, L)
@@ -148,82 +216,11 @@ def fit_batch_profile_gpu(
     optimizer = optim.LBFGS([model.raw], max_iter=max_iter)
     x_t = torch.arange(L, dtype=torch.double, device=device).unsqueeze(0).expand(B, L)
 
-    # --- helpers: theta->phi mapping in torch (vectorized) and numpy (for covariance) ---
-    def theta_to_phi_torch(theta: torch.Tensor) -> torch.Tensor:
-        """
-        theta: (...,13) torch.double tensor (last dim 13)
-        returns phi: (...,13) with ordering:
-        [m1_px, sigma1_px, A1, m2_px, sigma2_px, A2, m3_px, sigma3_px, A3, m4_px, sigma4_px, A4, bias]
-        """
-        m0_ang = theta[..., 0]
-        d0_ang = theta[..., 1]
-        d1_frac = theta[..., 2]
-        d2_frac = theta[..., 3]
-        s1_ang = theta[..., 4]
-        s2_ang = theta[..., 5]
-        fs3 = theta[..., 6]
-        fs4 = theta[..., 7]
-        A1 = theta[..., 8]
-        A2 = theta[..., 9]
-        fA3 = theta[..., 10]
-        fA4 = theta[..., 11]
-        bias = theta[..., 12]
-
-        inv_px = 1.0 / float(pixel_size)
-        m0_px = m0_ang * inv_px - float(i0)
-        delta0_px = d0_ang * inv_px
-        delta1_px = delta0_px * d1_frac
-        delta2_px = delta0_px * d2_frac
-        sigma1_px = s1_ang * inv_px
-        sigma2_px = s2_ang * inv_px
-        sigma3_px = sigma1_px * fs3
-        sigma4_px = sigma2_px * fs4
-
-        m1_px = m0_px - delta0_px
-        m2_px = m0_px + delta0_px
-        m3_px = m1_px + delta1_px
-        m4_px = m2_px - delta2_px
-
-        A3 = A1 * fA3
-        A4 = A2 * fA4
-
-        phi = torch.stack([
-            m1_px, sigma1_px, A1,
-            m2_px, sigma2_px, A2,
-            m3_px, sigma3_px, A3,
-            m4_px, sigma4_px, A4,
-            bias
-        ], dim=-1)
-        return phi
-
-    def theta_to_phi_np(theta_np: np.ndarray) -> np.ndarray:
-        """theta_np: (13,) numpy -> returns phi_np (13,) numpy"""
-        m0_ang, d0_ang, d1_frac, d2_frac, s1_ang, s2_ang, fs3, fs4, A1, A2, fA3, fA4, bias = theta_np
-        m0_px    = m0_ang / pixel_size - i0
-        delta0_px= d0_ang / pixel_size
-        delta1_px= delta0_px * d1_frac
-        delta2_px= delta0_px * d2_frac
-        sigma1_px= s1_ang / pixel_size
-        sigma2_px= s2_ang / pixel_size
-        sigma3_px= sigma1_px * fs3
-        sigma4_px= sigma2_px * fs4
-        m1_px = m0_px - delta0_px
-        m2_px = m0_px + delta0_px
-        m3_px = m1_px + delta1_px
-        m4_px = m2_px - delta2_px
-        A3 = A1 * fA3
-        A4 = A2 * fA4
-        return np.array([m1_px, sigma1_px, A1,
-                         m2_px, sigma2_px, A2,
-                         m3_px, sigma3_px, A3,
-                         m4_px, sigma4_px, A4,
-                         bias], dtype=float)
-
     # --- build phi_init (torch for closure) and phi_init_np for covariance R building ---
     with torch.no_grad():
         theta_init_t = torch.from_numpy(init_abs.astype(np.float64)).to(device=device, dtype=torch.double)
-        phi_init_torch = theta_to_phi_torch(theta_init_t.unsqueeze(0)).squeeze(0)  # (13,) torch
-    phi_init_np = theta_to_phi_np(init_abs)  # numpy (13,)
+        phi_init_torch = theta_to_phi(theta_init_t.unsqueeze(0), pixel_size, i0).squeeze(0)  # (13,) torch
+    #phi_init_np = theta_to_phi_np(init_abs)  # numpy (13,)
 
     # --- Gauss-Newton R builder (numpy), returns 13x13 ---
     def build_R_GN(phi: np.ndarray, reg_lambda_local: float) -> np.ndarray:
@@ -316,7 +313,7 @@ def fit_batch_profile_gpu(
 
         if reg_lambda > 0:
             theta_batch = model.lb + (model.ub - model.lb) * torch.sigmoid(model.raw)  # (B,13)
-            phi_batch = theta_to_phi_torch(theta_batch)  # (B,13)
+            phi_batch = theta_to_phi(theta_batch, pixel_size, i0)
             eps_div = 1e-12
 
             pen1  = (phi_batch[:, 12] - phi_init_torch[12])**2
@@ -379,8 +376,8 @@ def fit_batch_profile_gpu(
         sig_b = 1.0 / (1.0 + np.exp(-raw_b))
         theta_b = lb_abs + (ub_abs - lb_abs) * sig_b  # (13,)
 
-        phi_b = theta_to_phi_np(theta_b)  # (13,)
-
+        phi_b = theta_to_phi(theta_b, pixel_size, i0)  # (13,) numpy
+        
         # Jacobian of model outputs wrt phi (L,13)
         old_params_b = phi_b.tolist()
         Jb = gaussian_quad_jac(np.arange(L), *old_params_b)  # (L,13)
