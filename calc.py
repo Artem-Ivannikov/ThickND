@@ -523,7 +523,7 @@ class ThicknessCalculator:
                     #dof_k += 3
                     #print('A4 is small')
                     tolmask = [0,1,2,4,5,6,8,9,10,12]
-                if theta[10] < amp_threshold and p[11] < amp_threshold:
+                if theta[10] < amp_threshold and theta[11] < amp_threshold:
                     tolmask = [0,1,4,5,8,9,12]
 
                 if (np.isclose(theta[tolmask], lb_abs[tolmask], rtol=tol).any() or
