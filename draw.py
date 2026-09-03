@@ -5,7 +5,7 @@ from matplotlib.colors import ListedColormap
 from IPython.display import display, clear_output
 from typing import Optional, Tuple
 import torch
-from calc import gaussian_quad
+from calc import gaussian_quad, theta_to_phi
 
 from calc import ThicknessCalculator, fit_batch_profile_gpu
 
@@ -314,15 +314,28 @@ class ThicknessViewer:
                       cmap='gray')
     
     def plot_profile_point(self,
-                           x_angs: float,
-                           y_angs: float,
-                           template_idx: Optional[int] = None,
-                           full_range: bool = False,
-                           corr_length: float = 6/1.7741,
-                           reg_lambda: float = 0.0) -> None:
+                        x_angs: float,
+                        y_angs: float,
+                        template_idx: Optional[int] = None,
+                        full_range: bool = False,
+                        corr_length: float = 6/1.7741,
+                        reg_lambda: float = 0.0,
+                        max_rmse: float = 0.1,
+                        tol: float = 1e-3) -> None:
         """
         Plot intensity profile at (x,y) in Å using the batched GPU fitter,
-        under the new 4-Gaussian reparam scheme.
+        under the 4-Gaussian reparam scheme.
+
+        Parameters
+        ----------
+        x_angs, y_angs : float
+            Coordinates in Å (will be rounded to nearest pixel).
+        template_idx : int or None
+            If given, only this template is tried; otherwise all templates are attempted.
+        full_range : bool
+            If True, plot the full Z range of the profile; otherwise only the fitted segment.
+        corr_length, reg_lambda : passed to the fitter.
+        max_rmse, tol : acceptance criteria (same meaning as in compute_thickness).
         """
         calc = self.calc
         pix  = calc.pixel_size
@@ -335,98 +348,103 @@ class ThicknessViewer:
 
         # 2) choose templates
         tlist = ([template_idx]
-                 if template_idx is not None
-                 else list(range(len(calc.fit_templates))))
+                if template_idx is not None
+                else list(range(len(calc.fit_templates))))
 
         for t_idx in tlist:
             init_abs, lb_abs, ub_abs, (z_lo, z_hi) = calc.fit_templates[t_idx]
-            i0 = round(z_lo/pix);  i1 = round(z_hi/pix)
+            i0 = round(z_lo/pix)
+            i1 = round(z_hi/pix)
             seg = prof[i0:i1]
             if seg.size == 0:
                 continue
 
-            # 3) one-element batch
-            params_b, covs_b, ssr_b, dof = fit_batch_profile_gpu(
+            # 3) one-element batch fit
+            params_b, covs_b, ssr_b, dof_array = fit_batch_profile_gpu(
                 seg[np.newaxis,:],
                 init_abs, lb_abs, ub_abs,
                 i0, pix, corr_length, reg_lambda
             )
-            if params_b is None:
+
+            p   = params_b[0]          # (13,) raw logits
+            cov = covs_b[0]
+            ssr = ssr_b[0]
+            dof = dof_array[0]
+
+            # Convert raw logits to physical theta (absolute Å)
+            theta = lb_abs + (ub_abs - lb_abs) * torch.sigmoid(torch.from_numpy(p).to('cpu')).detach().numpy()
+
+            # Acceptance check (same as compute_thickness)
+            # We skip the template if any of the key parameters hit bounds or RMSE too high
+            tolmask = list(range(13))
+            # (You can replicate the logic from compute_thickness if needed; here we use a simple bound check)
+            if (np.isclose(theta[tolmask], lb_abs[tolmask], rtol=tol).any() or
+                np.isclose(theta[tolmask], ub_abs[tolmask], rtol=tol).any()):
                 continue
 
-            p  = params_b[0]    # length 13
-            cov= covs_b[0]
+            rmse = np.sqrt(ssr / dof) if dof > 0 else np.inf
+            if rmse > max_rmse:
+                continue
 
-            theta = lb_abs + (ub_abs - lb_abs) * torch.sigmoid(torch.from_numpy(p).to('cpu')).detach().numpy()  # (B,13) in Å for means/deltas/sigmas
-            print(theta)
+            # Good fit found – now plot
+            # Convert theta to phi (pixel‑relative Gaussian parameters)
+            phi = theta_to_phi(theta, pix, i0)   # numpy array (13,)
+            m1_px, s1_px, A1, m2_px, s2_px, A2, m3_px, s3_px, A3, m4_px, s4_px, A4, bias = phi
 
-            # 4) reconstruct all 4 means, sigmas, amps, bias in Å
-            #    exactly matching your fitting reparam
-            # unpack
-            (m0_ang,  delta0,  delta1_frac,  delta2_frac,
-             sigma1,  sigma2, fs3, fs4,
-             A1,   A2, fA3,  fA4, b) = theta
-
-            delta1 = delta0 * delta1_frac
-            delta2 = delta0 * delta2_frac
-
-            # pixel→Å conversion + z_start shift
-            sigma3   = sigma1 * fs3
-            sigma4   = sigma2 * fs4
-            amp1     = A1
-            amp2     = A2
-            amp3     = A1 * fA3
-            amp4     = A2 * fA4
-
-            # means
-            m1 = m0_ang - delta0
-            m2 = m0_ang + delta0
-            m3 = m1      + delta1
-            m4 = m2      - delta2
-
+            # Compute absolute positions in Å for display
+            m1 = (m1_px + i0) * pix
+            m2 = (m2_px + i0) * pix
+            m3 = (m3_px + i0) * pix
+            m4 = (m4_px + i0) * pix
+            sigma1 = s1_px * pix
+            sigma2 = s2_px * pix
+            sigma3 = s3_px * pix
+            sigma4 = s4_px * pix
             thickness = m2 - m1
 
-            s1r = sigma1 / pix
-            s2r = sigma2 / pix
-            s3r = sigma3 / pix
-            s4r = sigma4 / pix
-
-            m1r = m1 / pix - i0
-            m2r = m2 / pix - i0
-            m3r = m3 / pix - i0
-            m4r = m4 / pix - i0
-
-            # 5) print
-            #print('Covarience matrix', cov, np.linalg.inv(cov))
             print(f"Fit at ({x_angs:.1f}Å, {y_angs:.1f}Å), tpl={t_idx}:")
-            print(f"  Peak1: z={m1:.2f}Å, σ={sigma1:.2f}Å, A={amp1:.2f}")
-            print(f"  Peak2: z={m2:.2f}Å, σ={sigma2:.2f}Å, A={amp2:.2f}")
-            print(f"  Peak3: z={m3:.2f}Å, σ={sigma3:.2f}Å, A={amp3:.2f}")
-            print(f"  Peak4: z={m4:.2f}Å, σ={sigma4:.2f}Å, A={amp4:.2f}")
-            print(f"  Offset={b:.2f}; Thickness={thickness:.2f}Å")
+            print(f"  Peak1: z={m1:.2f}Å, σ={sigma1:.2f}Å, A={A1:.2f}")
+            print(f"  Peak2: z={m2:.2f}Å, σ={sigma2:.2f}Å, A={A2:.2f}")
+            print(f"  Peak3: z={m3:.2f}Å, σ={sigma3:.2f}Å, A={A3:.2f}")
+            print(f"  Peak4: z={m4:.2f}Å, σ={sigma4:.2f}Å, A={A4:.2f}")
+            print(f"  Offset={bias:.2f}; Thickness={thickness:.2f}Å")
 
-            # 6) plot
+            # Plot
             plt.figure(figsize=(6,4))
             if full_range:
-                norm_full = prof/(prof.max()+1e-8)
-                plt.plot(z_full, norm_full, 'o', alpha=0.6, label='Raw Data')
+                # Normalise both data and model by the full profile maximum
+                norm_factor = prof.max() if prof.max() > 0 else 1.0
+                norm_prof = prof / norm_factor
+                plt.plot(z_full, norm_prof, 'o', alpha=0.6, label='Raw Data')
+                z_plot = z_full
+                x_plot = z_plot / pix - i0
+                # Scale amplitudes to match full-profile normalisation
+                scale = seg.max() / norm_factor if norm_factor != 0 else 1.0
+                fit_curve = gaussian_quad(x_plot,
+                                        m1_px, s1_px, A1 * scale,
+                                        m2_px, s2_px, A2 * scale,
+                                        m3_px, s3_px, A3 * scale,
+                                        m4_px, s4_px, A4 * scale,
+                                        bias * scale)
             else:
                 z_seg = np.linspace(i0*pix, i1*pix, seg.size)
-                norm_seg = seg/(seg.max()+1e-8)
+                norm_seg = seg / (seg.max() + 1e-8)
                 plt.plot(z_seg, norm_seg, 'o', alpha=0.8, label='Segment')
-
-            z_plot = z_full if full_range else z_seg #np.linspace(z_lo, z_hi, seg.size)
-            # fit curve via gaussian_quad
-            x_plot = z_plot / pix - i0
-            fit_curve = gaussian_quad(x_plot,
-                                      m1r, s1r, amp1,
-                                      m2r, s2r, amp2,
-                                      m3r, s3r, amp3,
-                                      m4r, s4r, amp4,
-                                      b)
+                z_plot = z_seg
+                x_plot = z_plot / pix - i0
+                # Amplitudes already normalised to segment max
+                fit_curve = gaussian_quad(x_plot,
+                                        m1_px, s1_px, A1,
+                                        m2_px, s2_px, A2,
+                                        m3_px, s3_px, A3,
+                                        m4_px, s4_px, A4,
+                                        bias)
             plt.plot(z_plot, fit_curve, '-', lw=2, label='Fit')
-            plt.xlabel('Z (Å)'); plt.ylabel('Normalized Intensity')
-            plt.legend(); plt.grid(True); plt.tight_layout()
+            plt.xlabel('Z (Å)')
+            plt.ylabel('Normalized Intensity')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
             plt.show()
             return
 
@@ -447,11 +465,22 @@ class ThicknessViewer:
         """
         Plot the profile using precomputed θ from compute_thickness, without refitting.
 
-        New args:
+        Parameters
+        ----------
+        x_angs, y_angs : float
+            Coordinates in Å.
+        full_range : bool
+            If True, plot the full Z range; otherwise only the fitted segment.
+        ax : matplotlib.axes.Axes or None
+            If given, draw on this axis; otherwise create a new figure.
+        verbose : bool
+            Print fit parameters.
+        annotate_thickness : bool
+            Add a text box with thickness.
         thickness_label_fontsize : int
-            Font size used when drawing the "Thickness = ..." annotation (when annotate_thickness=True).
+            Font size for the annotation.
         thickness_label_bbox : dict or None
-            Optional bbox kwargs passed to ax.text. If None, a sensible default is used.
+            Bbox properties for the annotation.
         """
         import matplotlib.pyplot as plt
         import numpy as np
@@ -464,79 +493,91 @@ class ThicknessViewer:
         calc = self.calc
         pix = calc.pixel_size
 
-        # ---- coordinates & stored fit ----
+        # Coordinates
         i = round(y_angs / pix)
         j = round(x_angs / pix)
-        theta = calc.theta_map[i, j, :]
-        t_idx = calc.template_map[i, j]
-        init_abs, lb_abs, ub_abs, (z_lo, z_hi) = calc.fit_templates[t_idx]
-        i0 = round(z_lo / pix)
-        i1 = round(z_hi / pix)
 
+        # Check that a fit exists
+        t_idx = calc.template_map[i, j]
+        if t_idx < 0:
+            if verbose:
+                print(f"No fit stored at ({x_angs:.1f}Å,{y_angs:.1f}Å)")
+            return ax
+
+        theta = calc.theta_map[i, j, :]
         if np.isnan(theta).any():
             if verbose:
                 print(f"No fit stored at ({x_angs:.1f}Å,{y_angs:.1f}Å)")
             return ax
+
+        # Retrieve template info for segment boundaries
+        _, _, _, (z_lo, z_hi) = calc.fit_templates[t_idx]
+        i0 = round(z_lo / pix)
+        i1 = round(z_hi / pix)
 
         prof = calc.smoothed_volume[:, i, j].astype(float)
         zdim = prof.size
         z_full = np.arange(zdim) * pix
         seg = prof[i0:i1]
 
-        (m0_ang, delta0, delta1_frac, delta2_frac,
-        sigma1, sigma2, fs3, fs4,
-        A1, A2, fA3, fA4, b) = theta
+        # Convert stored theta (absolute) to phi (pixel‑relative)
+        phi = theta_to_phi(theta, pix, i0)   # numpy array (13,)
+        m1_px, s1_px, A1, m2_px, s2_px, A2, m3_px, s3_px, A3, m4_px, s4_px, A4, bias = phi
 
-        delta1 = delta0 * delta1_frac
-        delta2 = delta0 * delta2_frac
-
-        sigma3 = sigma1 * fs3
-        sigma4 = sigma2 * fs4
-
-        m1 = m0_ang - delta0
-        m2 = m0_ang + delta0
-        m3 = m1 + delta1
-        m4 = m2 - delta2
-
+        # Compute absolute positions for display
+        m1 = (m1_px + i0) * pix
+        m2 = (m2_px + i0) * pix
+        m3 = (m3_px + i0) * pix
+        m4 = (m4_px + i0) * pix
+        sigma1 = s1_px * pix
+        sigma2 = s2_px * pix
+        sigma3 = s3_px * pix
+        sigma4 = s4_px * pix
         thickness = m2 - m1
 
-        # ---- verbose output (controlled) ----
         if verbose:
             print(theta)
             print(f"Fit at ({x_angs:.1f}Å, {y_angs:.1f}Å), tpl={t_idx}:")
             print(f"  Peak1: z={m1:.2f}Å, σ={sigma1:.2f}Å, A={A1:.2f}")
             print(f"  Peak2: z={m2:.2f}Å, σ={sigma2:.2f}Å, A={A2:.2f}")
-            print(f"  Peak3: z={m3:.2f}Å, σ={sigma3:.2f}Å, A={A1*fA3:.2f}")
-            print(f"  Peak4: z={m4:.2f}Å, σ={sigma4:.2f}Å, A={A2*fA4:.2f}")
-            print(f"  Offset={b:.2f}; Thickness={thickness:.2f}Å")
+            print(f"  Peak3: z={m3:.2f}Å, σ={sigma3:.2f}Å, A={A3:.2f}")
+            print(f"  Peak4: z={m4:.2f}Å, σ={sigma4:.2f}Å, A={A4:.2f}")
+            print(f"  Offset={bias:.2f}; Thickness={thickness:.2f}Å")
 
-        # ---- plotting ----
+        # Plot data and model
         if full_range:
-            norm = prof / (prof.max() + 1e-8)
-            ax.plot(z_full, norm, 'o', alpha=0.6, label='Raw Data')
+            norm_factor = prof.max() if prof.max() > 0 else 1.0
+            norm_prof = prof / norm_factor
+            ax.plot(z_full, norm_prof, 'o', alpha=0.6, label='Raw Data')
             z_plot = z_full
             x_plot = z_plot / pix - i0
+            # Scale amplitudes to full-profile normalisation
+            scale = seg.max() / norm_factor if norm_factor != 0 else 1.0
+            fit_curve = gaussian_quad(x_plot,
+                                    m1_px, s1_px, A1 * scale,
+                                    m2_px, s2_px, A2 * scale,
+                                    m3_px, s3_px, A3 * scale,
+                                    m4_px, s4_px, A4 * scale,
+                                    bias * scale)
         else:
             z_seg = np.linspace(i0 * pix, i1 * pix, seg.size)
-            norm = seg / (seg.max() + 1e-8)
-            ax.plot(z_seg, norm, 'o', alpha=0.8, label='Segment')
+            norm_seg = seg / (seg.max() + 1e-8)
+            ax.plot(z_seg, norm_seg, 'o', alpha=0.8, label='Segment')
             z_plot = z_seg
             x_plot = z_plot / pix - i0
-
-        fit_curve = gaussian_quad(
-            x_plot,
-            m1 / pix - i0, sigma1 / pix, A1,
-            m2 / pix - i0, sigma2 / pix, A2,
-            m3 / pix - i0, sigma3 / pix, A1 * fA3,
-            m4 / pix - i0, sigma4 / pix, A2 * fA4,
-            b
-        )
+            fit_curve = gaussian_quad(x_plot,
+                                    m1_px, s1_px, A1,
+                                    m2_px, s2_px, A2,
+                                    m3_px, s3_px, A3,
+                                    m4_px, s4_px, A4,
+                                    bias)
 
         ax.plot(z_plot, fit_curve, '-', lw=2, label='Stored Fit')
 
-        # ---- thickness annotation (configurable) ----
         if annotate_thickness:
-            bbox = thickness_label_bbox if thickness_label_bbox is not None else dict(boxstyle='round', fc='white', ec='0.7', alpha=0.9)
+            bbox = thickness_label_bbox if thickness_label_bbox is not None else dict(
+                boxstyle='round', fc='white', ec='0.7', alpha=0.9
+            )
             ax.text(
                 0.5, 0.05,
                 f"Thickness = {thickness:.1f} Å",
@@ -558,5 +599,4 @@ class ThicknessViewer:
             plt.show()
 
         return ax
-
-            
+                
