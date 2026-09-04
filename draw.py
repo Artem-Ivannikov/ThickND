@@ -319,9 +319,7 @@ class ThicknessViewer:
                         template_idx: Optional[int] = None,
                         full_range: bool = False,
                         corr_length: float = 6/1.7741,
-                        reg_lambda: float = 0.0,
-                        max_rmse: float = 0.1,
-                        tol: float = 1e-3) -> None:
+                        reg_lambda: float = 0.0) -> None:
         """
         Plot intensity profile at (x,y) in Å using the batched GPU fitter,
         under the 4-Gaussian reparam scheme.
@@ -333,9 +331,8 @@ class ThicknessViewer:
         template_idx : int or None
             If given, only this template is tried; otherwise all templates are attempted.
         full_range : bool
-            If True, plot the full Z range of the profile; otherwise only the fitted segment.
+            If True, plot the full Z range; otherwise only the fitted segment.
         corr_length, reg_lambda : passed to the fitter.
-        max_rmse, tol : acceptance criteria (same meaning as in compute_thickness).
         """
         calc = self.calc
         pix  = calc.pixel_size
@@ -374,19 +371,6 @@ class ThicknessViewer:
             # Convert raw logits to physical theta (absolute Å)
             theta = lb_abs + (ub_abs - lb_abs) * torch.sigmoid(torch.from_numpy(p).to('cpu')).detach().numpy()
 
-            # Acceptance check (same as compute_thickness)
-            # We skip the template if any of the key parameters hit bounds or RMSE too high
-            tolmask = list(range(13))
-            # (You can replicate the logic from compute_thickness if needed; here we use a simple bound check)
-            if (np.isclose(theta[tolmask], lb_abs[tolmask], rtol=tol).any() or
-                np.isclose(theta[tolmask], ub_abs[tolmask], rtol=tol).any()):
-                continue
-
-            rmse = np.sqrt(ssr / dof) if dof > 0 else np.inf
-            if rmse > max_rmse:
-                continue
-
-            # Good fit found – now plot
             # Convert theta to phi (pixel‑relative Gaussian parameters)
             phi = theta_to_phi(theta, pix, i0)   # numpy array (13,)
             m1_px, s1_px, A1, m2_px, s2_px, A2, m3_px, s3_px, A3, m4_px, s4_px, A4, bias = phi
@@ -401,13 +385,14 @@ class ThicknessViewer:
             sigma3 = s3_px * pix
             sigma4 = s4_px * pix
             thickness = m2 - m1
+            rmse = np.sqrt(ssr / dof) if dof > 0 else np.inf
 
             print(f"Fit at ({x_angs:.1f}Å, {y_angs:.1f}Å), tpl={t_idx}:")
             print(f"  Peak1: z={m1:.2f}Å, σ={sigma1:.2f}Å, A={A1:.2f}")
             print(f"  Peak2: z={m2:.2f}Å, σ={sigma2:.2f}Å, A={A2:.2f}")
             print(f"  Peak3: z={m3:.2f}Å, σ={sigma3:.2f}Å, A={A3:.2f}")
             print(f"  Peak4: z={m4:.2f}Å, σ={sigma4:.2f}Å, A={A4:.2f}")
-            print(f"  Offset={bias:.2f}; Thickness={thickness:.2f}Å")
+            print(f"  Offset={bias:.2f}; Thickness={thickness:.2f}Å; RMSE={rmse:.4f}")
 
             # Plot
             plt.figure(figsize=(6,4))
@@ -482,8 +467,6 @@ class ThicknessViewer:
         thickness_label_bbox : dict or None
             Bbox properties for the annotation.
         """
-        import matplotlib.pyplot as plt
-        import numpy as np
 
         created_fig = False
         if ax is None:
