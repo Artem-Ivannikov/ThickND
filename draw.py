@@ -1,12 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import ipywidgets as widgets
-from matplotlib.colors import ListedColormap
 from IPython.display import display, clear_output
 from typing import Optional, Tuple
 import torch
 from calc import gaussian_quad, theta_to_phi
-
 from calc import ThicknessCalculator, fit_batch_profile_gpu
 
 def plot_2d_image(data: np.ndarray,
@@ -34,102 +32,93 @@ class ThicknessViewer:
     def __init__(self, calculator: ThicknessCalculator):
         self.calc = calculator
 
-    def plot_results(self,
-                     field: str = 'width',
-                     cmap: str = 'viridis') -> None:
-        """
-        Plot a computed 2D field (e.g., 'width', 'loss')
-        """
-        data = getattr(self.calc, field, None)
-        assert data is not None, f"Field '{field}' not found."
-        # choose mask
-        mask = None
-        if getattr(self.calc, 'fitting_mask', None) is not None:
-            mask = self.calc.fitting_mask.astype(bool)
-        elif self.calc.intensity_mask_2d is not None:
-            mask = self.calc.intensity_mask_2d.astype(bool)
-        elif self.calc.mask_2d is not None:
-            mask = self.calc.mask_2d.astype(bool)
+    # ---------- helper methods ----------
+    def _get_2d_mask(self) -> Optional[np.ndarray]:
+        """Return the most appropriate 2D mask or None."""
+        for attr in ['fitting_mask', 'intensity_mask_2d', 'mask_2d']:
+            mask = getattr(self.calc, attr, None)
+            if mask is not None:
+                return mask.astype(bool)
+        return None
+
+    def _set_angstrom_coord(self, ax, extra_info=None):
+        """Set format_coord to display Å, optionally with extra info."""
+        pix = self.calc.pixel_size
+
+        def format_coord(x, y):
+            s = f"x={x:.1f}Å, y={y:.1f}Å"
+            if extra_info:
+                i, j = int(y / pix), int(x / pix)
+                if 0 <= i < self.calc.width.shape[0] and 0 <= j < self.calc.width.shape[1]:
+                    s += extra_info(i, j)
+            return s
+
+        ax.format_coord = format_coord
+
+    def _plot_masked_map(self, data, mask, cmap, title, cbar_label,
+                         cbar_ticks=None, extra_coord_info=None):
+        """Common routine for plotting 2D data with mask background."""
         pix = self.calc.pixel_size
         ydim, xdim = data.shape
         extent = [0, xdim * pix, 0, ydim * pix]
 
-        # define regions
         valid = mask & ~np.isnan(data) if mask is not None else ~np.isnan(data)
-        #fail = mask & np.isnan(data) if mask is not None else np.zeros_like(data, bool)
         outside = (~mask) if mask is not None else np.zeros_like(data, bool)
 
         fig, ax = plt.subplots(figsize=(8, 6))
-        # background
         ax.set_facecolor('red')
-        # outside-mask dark gray
-        if outside.any():
-            out_img = np.zeros((ydim, xdim, 4))
-            out_img[outside] = (0.5, 0.5, 0.5, 1.0)
-            ax.imshow(out_img, extent=extent, origin='lower', interpolation='nearest', zorder=1)
-        # data
-        cm_data = plt.cm.get_cmap(cmap).copy()
-        data_img = np.ma.masked_where(~valid, data)
-        im = ax.imshow(data_img, cmap=cm_data,
-                       extent=extent, origin='lower', interpolation='nearest', zorder=2)
-        fig.colorbar(im, ax=ax, label=field)
-        # failures red
-        #if fail.any():
-        #    fail_img = np.zeros((ydim, xdim, 4))
-        #    fail_img[fail] = (1.0, 0.0, 0.0, 1.0)
-        #    ax.imshow(fail_img, extent=extent, origin='lower', interpolation='nearest', zorder=3)
-        ax.set_title(f"{field.capitalize()} Map")
-        ax.set_xlabel("X (Å)")
-        ax.set_ylabel("Y (Å)")
-        ax.format_coord = lambda x, y: f"x={x:.1f}Å, y={y:.1f}Å"
-        plt.show()
 
-    def plot_template_map(self) -> None:
-        """Plot template indices per pixel with axes in Å, highlighting failures in gray."""
-        tmap = self.calc.template_map
-        assert tmap is not None, "Run compute_thickness first."
-        pix = self.calc.pixel_size
-        ydim, xdim = tmap.shape
-        extent = [0, xdim * pix, 0, ydim * pix]
-
-        # determine masks
-        mask = None
-        if getattr(self.calc, 'fitting_mask', None) is not None:
-            mask = self.calc.fitting_mask.astype(bool)
-        elif self.calc.intensity_mask_2d is not None:
-            mask = self.calc.intensity_mask_2d.astype(bool)
-        elif self.calc.mask_2d is not None:
-            mask = self.calc.mask_2d.astype(bool)
-
-        valid = mask & (tmap >= 0) if mask is not None else (tmap >= 0)
-        #fail = mask & (tmap < 0) if mask is not None else np.zeros_like(tmap, bool)
-        #outside = mask is not None and ~mask or np.zeros_like(tmap, bool)
-        outside = (~mask) if mask is not None else np.zeros_like(tmap, bool)
-
-        fig, ax = plt.subplots(figsize=(8, 6))
-        # background
-        ax.set_facecolor('lightgray')
-        # outside-mask dark gray
         if outside.any():
             out_img = np.zeros((ydim, xdim, 4))
             out_img[outside] = (0.33, 0.33, 0.33, 1.0)
-            ax.imshow(out_img, extent=extent, origin='lower', interpolation='nearest', zorder=1)
-        # data colormap
-        cmap = plt.get_cmap('tab10', len(self.calc.fit_templates))
-        data_img = np.ma.masked_where(~valid, tmap)
-        im = ax.imshow(data_img, origin='lower', extent=extent,
-                       interpolation='nearest', cmap=cmap, zorder=2)
-        fig.colorbar(im, ax=ax, ticks=range(len(self.calc.fit_templates)), label='Template Index')
-        # failures in red
-        #if fail.any():
-        #    fail_img = np.zeros((ydim, xdim, 4))
-        #    fail_img[fail] = (1.0, 0.0, 0.0, 1.0)
-        #    ax.imshow(fail_img, extent=extent, origin='lower', interpolation='nearest', zorder=3)
+            ax.imshow(out_img, extent=extent, origin='lower',
+                      interpolation='nearest', zorder=1)
 
-        ax.set_title('Template Map')
-        ax.set_xlabel('X (Å)')
-        ax.set_ylabel('Y (Å)')
-        ax.format_coord = lambda x, y: f"x={x:.1f}Å, y={y:.1f}Å, tpl={int(tmap[int(y/pix), int(x/pix)]) if 0<=int(y/pix)<ydim and 0<=int(x/pix)<xdim else 'NA'}"
+        data_img = np.ma.masked_where(~valid, data)
+        im = ax.imshow(data_img, cmap=cmap, extent=extent, origin='lower',
+                       interpolation='nearest', zorder=2)
+
+        cbar = fig.colorbar(im, ax=ax, label=cbar_label)
+        if cbar_ticks is not None:
+            cbar.set_ticks(cbar_ticks)
+
+        ax.set_title(title)
+        ax.set_xlabel("X (Å)")
+        ax.set_ylabel("Y (Å)")
+        self._set_angstrom_coord(ax, extra_coord_info)
+        return fig, ax
+
+    # ---------- unified map plotting ----------
+    def plot_map(self, field: str = 'width', cmap: str = 'viridis') -> None:
+        """
+        Plot a computed 2D field (e.g., 'width', 'loss', 'template_map').
+
+        For 'template_map', a categorical colormap is used and the colorbar
+        shows integer template indices. Other fields use a continuous colormap.
+        """
+        data = getattr(self.calc, field, None)
+        assert data is not None, f"Field '{field}' not found."
+
+        mask = self._get_2d_mask()
+
+        if field == 'template_map':
+            # Special handling for template indices
+            cmap = plt.get_cmap('tab10', len(self.calc.fit_templates))
+            cbar_ticks = range(len(self.calc.fit_templates))
+            title = 'Template Map'
+            cbar_label = 'Template Index'
+            #extra_info = lambda i, j: f", tpl={int(data[i, j])}"
+        else:
+            # Generic continuous field
+            cbar_ticks = None
+            title = f"{field.capitalize()} Map"
+            cbar_label = field
+            #extra_info = None
+
+        fig, ax = self._plot_masked_map(
+            data, mask, cmap=cmap, title=title, cbar_label=cbar_label,
+            cbar_ticks=cbar_ticks, #extra_coord_info=extra_info
+        )
         plt.show()
 
     def plot_projection(self,
@@ -467,7 +456,6 @@ class ThicknessViewer:
         thickness_label_bbox : dict or None
             Bbox properties for the annotation.
         """
-
         created_fig = False
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4))
@@ -482,10 +470,12 @@ class ThicknessViewer:
 
         # Check that a fit exists
         t_idx = calc.template_map[i, j]
-        if t_idx < 0:
+        # template_map may contain NaN for failed pixels; convert to int only if valid
+        if np.isnan(t_idx):
             if verbose:
                 print(f"No fit stored at ({x_angs:.1f}Å,{y_angs:.1f}Å)")
             return ax
+        t_idx = int(t_idx)
 
         theta = calc.theta_map[i, j, :]
         if np.isnan(theta).any():
@@ -534,7 +524,6 @@ class ThicknessViewer:
             ax.plot(z_full, norm_prof, 'o', alpha=0.6, label='Raw Data')
             z_plot = z_full
             x_plot = z_plot / pix - i0
-            # Scale amplitudes to full-profile normalisation
             scale = seg.max() / norm_factor if norm_factor != 0 else 1.0
             fit_curve = gaussian_quad(x_plot,
                                     m1_px, s1_px, A1 * scale,
@@ -582,4 +571,3 @@ class ThicknessViewer:
             plt.show()
 
         return ax
-                

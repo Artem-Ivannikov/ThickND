@@ -466,7 +466,7 @@ class ThicknessCalculator:
         self.width        = np.full((ydim, xdim), np.nan)
         self.width_sigma  = np.full((ydim, xdim), np.nan)
         self.loss         = np.full((ydim, xdim), np.nan)
-        self.template_map = np.full((ydim, xdim),   -1, dtype=int)
+        self.template_map = np.full((ydim, xdim),   np.nan)
         self.theta_map    = np.full((ydim, xdim, 13), np.nan)
 
         unassigned = np.ones((ydim, xdim), dtype=bool)
