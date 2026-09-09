@@ -20,10 +20,10 @@ def gaussian_quad(x: np.ndarray,
                   m4: float, s4: float, a4: float,
                   b: float) -> np.ndarray:
     """Sum of 4 Gaussians plus constant bias."""
-    g1 = a1 * np.exp(-0.5 * ((x-m1)/s1)**2)
-    g2 = a2 * np.exp(-0.5 * ((x-m2)/s2)**2)
-    g3 = a3 * np.exp(-0.5 * ((x-m3)/s3)**2)
-    g4 = a4 * np.exp(-0.5 * ((x-m4)/s4)**2)
+    g1 = a1 * np.exp(-0.5 * ((x - m1) / s1) ** 2)
+    g2 = a2 * np.exp(-0.5 * ((x - m2) / s2) ** 2)
+    g3 = a3 * np.exp(-0.5 * ((x - m3) / s3) ** 2)
+    g4 = a4 * np.exp(-0.5 * ((x - m4) / s4) ** 2)
     return g1 + g2 + g3 + g4 + b
 
 def gaussian_quad_jac(x: np.ndarray,
@@ -36,10 +36,10 @@ def gaussian_quad_jac(x: np.ndarray,
     x = x[:, None]  # (N,1)
     def grads(mi, si, ai):
         d = x - mi
-        expv = np.exp(-0.5*(d/si)**2)
-        dm = ai * expv * (d/si**2)
-        ds = ai * expv * (d**2/si**3)
-        da =        expv
+        expv = np.exp(-0.5 * (d / si) ** 2)
+        dm = ai * expv * (d / si ** 2)
+        ds = ai * expv * (d ** 2 / si ** 3)
+        da = expv
         return dm, ds, da
 
     dm1, ds1, da1 = grads(m1, s1, a1)
@@ -56,7 +56,7 @@ def gaussian_quad_jac(x: np.ndarray,
         db
     ])  # (N,13)
 
-def theta_to_phi(theta, pixel_size, i0):
+def theta_to_phi(theta, pixel_size: float, i0: int):
     """
     Convert 13 raw theta parameters (absolute Å, unitless fractions) to
     13 phi parameters (pixel‑relative means, pixel sigmas, unitless amplitudes).
@@ -144,8 +144,8 @@ class BatchedQuadGaussianModel(nn.Module):
         super().__init__()
         self.device = device
         self.raw    = nn.Parameter(torch.zeros(batch_size, 13, dtype=torch.double, device=device))
-        self.lb     = torch.tensor(lb, dtype=torch.double, device=device).view(1,13)
-        self.ub     = torch.tensor(ub, dtype=torch.double, device=device).view(1,13)
+        self.lb     = torch.tensor(lb, dtype=torch.double, device=device).view(1, 13)
+        self.ub     = torch.tensor(ub, dtype=torch.double, device=device).view(1, 13)
         self.i0        = i0
         self.pixel_size = pixel_size
 
@@ -167,14 +167,13 @@ class BatchedQuadGaussianModel(nn.Module):
         xp = x.unsqueeze(2)  # (B,L,1)
         def G(m, s, A):
             z = (xp - m.unsqueeze(-1).unsqueeze(-1)) / s.unsqueeze(-1).unsqueeze(-1)
-            return A.unsqueeze(-1).unsqueeze(-1) * torch.exp(-0.5*z*z)
+            return A.unsqueeze(-1).unsqueeze(-1) * torch.exp(-0.5 * z * z)
 
         g1 = G(m1_px, sigma1_px, A1)
         g2 = G(m2_px, sigma2_px, A2)
         g3 = G(m3_px, sigma3_px, A3)
         g4 = G(m4_px, sigma4_px, A4)
         return (g1 + g2 + g3 + g4 + bias.unsqueeze(-1).unsqueeze(-1)).squeeze(2)  # (B,L)
-
 
 def fit_batch_profile_gpu(
     segments: np.ndarray,          # (B, L)
@@ -190,41 +189,39 @@ def fit_batch_profile_gpu(
     """
     Fit B profiles of length L in one batch on GPU using 4 Gaussians.
     Returns:
-      params_batch: (B,13)     -- raw parameters (same as original)
-      cov_batch:    (B,13,13)  -- covariance in phi-space (old params, pixels)
+      params_batch: (B,13)     -- raw parameters (logits)
+      cov_batch:    (B,13,13)  -- covariance in phi-space (pixel units)
       ssr_batch:    (B,)
       dof_array:    (B,)       -- per-profile degrees of freedom (N_eff - df_eff)
     """
-
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     B, L = segments.shape
     seg_t = torch.from_numpy(segments.astype(np.float64)).to(device)
     y_norm = seg_t / (seg_t.amax(dim=1, keepdim=True) + 1e-8)
 
-    # build model with bounds (unchanged)
-    model = BatchedQuadGaussianModel(B,
-                                     lb_abs, ub_abs,
-                                     i0=i0, pixel_size=pixel_size,
-                                     device=device)
-    # invert sigmoid to set raw so that θ(init) = init_abs
+    # Build model
+    model = BatchedQuadGaussianModel(B, lb_abs, ub_abs,
+                                     i0=i0, pixel_size=pixel_size, device=device)
+
+    # Initialize raw parameters such that sigmoid(raw) maps to init_abs
     p0 = (init_abs - lb_abs) / (ub_abs - lb_abs)
     eps = 1e-6
-    p0 = np.clip(p0, eps, 1-eps)
-    raw0 = np.log(p0/(1-p0))  # logit
-    model.raw.data[:] = torch.from_numpy(raw0).to(device).unsqueeze(0).expand(B,13)
+    p0 = np.clip(p0, eps, 1 - eps)
+    raw0 = np.log(p0 / (1 - p0))  # logit
+    with torch.no_grad():
+        model.raw.copy_(torch.from_numpy(raw0).to(device).unsqueeze(0).expand(B, 13))
 
     optimizer = optim.LBFGS([model.raw], max_iter=max_iter)
     x_t = torch.arange(L, dtype=torch.double, device=device).unsqueeze(0).expand(B, L)
 
-    # --- build phi_init (torch for closure) and phi_init_np for covariance R building ---
+    # Initial phi for regularisation
     with torch.no_grad():
         theta_init_t = torch.from_numpy(init_abs.astype(np.float64)).to(device=device, dtype=torch.double)
-        phi_init_torch = theta_to_phi(theta_init_t.unsqueeze(0), pixel_size, i0).squeeze(0)  # (13,) torch
-    #phi_init_np = theta_to_phi_np(init_abs)  # numpy (13,)
+        phi_init_torch = theta_to_phi(theta_init_t.unsqueeze(0), pixel_size, i0).squeeze(0)  # (13,)
 
-    # --- Gauss-Newton R builder (numpy), returns 13x13 ---
+    # Gauss-Newton R builder (numpy), returns 13x13
     def build_R_GN(phi: np.ndarray, reg_lambda_local: float) -> np.ndarray:
-        R = np.zeros((13,13), dtype=float)
+        R = np.zeros((13, 13), dtype=float)
         if reg_lambda_local <= 0.0:
             return R
         eps_small = 1e-12
@@ -256,7 +253,7 @@ def fit_batch_profile_gpu(
         A1s = A1 if abs(A1) > eps_small else eps_small
         g = np.zeros(13)
         g[8] = 1.0 / A1s
-        g[2] = - A3 / (A1s**2)
+        g[2] = - A3 / (A1s ** 2)
         add_rank1(g)
 
         # f8: A4/A2  (phi[11] / phi[5])
@@ -264,7 +261,7 @@ def fit_batch_profile_gpu(
         A2s = A2 if abs(A2) > eps_small else eps_small
         g = np.zeros(13)
         g[11] = 1.0 / A2s
-        g[5]  = - A4 / (A2s**2)
+        g[5]  = - A4 / (A2s ** 2)
         add_rank1(g)
 
         # f9: sigma3/sigma1  (phi[7]/phi[1])
@@ -272,7 +269,7 @@ def fit_batch_profile_gpu(
         s1s = s1 if abs(s1) > eps_small else eps_small
         g = np.zeros(13)
         g[7] = 1.0 / s1s
-        g[1] = - s3 / (s1s**2)
+        g[1] = - s3 / (s1s ** 2)
         add_rank1(g)
 
         # f10: sigma4/sigma2 (phi[10]/phi[4])
@@ -280,7 +277,7 @@ def fit_batch_profile_gpu(
         s2s = s2 if abs(s2) > eps_small else eps_small
         g = np.zeros(13)
         g[10] = 1.0 / s2s
-        g[4]  = - s4 / (s2s**2)
+        g[4]  = - s4 / (s2s ** 2)
         add_rank1(g)
 
         # f11: 2*(m3 - m1)/(m2 - m1)
@@ -288,8 +285,8 @@ def fit_batch_profile_gpu(
         v = b - a
         vs = v if abs(v) > eps_small else eps_small
         g = np.zeros(13)
-        g[0] = 2.0 * (c - b) / (vs**2)
-        g[3] = -2.0 * (c - a) / (vs**2)
+        g[0] = 2.0 * (c - b) / (vs ** 2)
+        g[3] = -2.0 * (c - a) / (vs ** 2)
         g[6] = 2.0 / vs
         add_rank1(g)
 
@@ -298,52 +295,52 @@ def fit_batch_profile_gpu(
         v = b - a
         vs = v if abs(v) > eps_small else eps_small
         g = np.zeros(13)
-        g[0] = 2.0 * (b - d) / (vs**2)
-        g[3] = 2.0 * (d - a) / (vs**2)
+        g[0] = 2.0 * (b - d) / (vs ** 2)
+        g[3] = 2.0 * (d - a) / (vs ** 2)
         g[9] = -2.0 / vs
         add_rank1(g)
 
         return R
 
-    # --- LBFGS closure (PyTorch only) ---
+    # LBFGS closure
     def closure():
         optimizer.zero_grad()
-        y_pred = model(x_t)                                 # (B,L)
-        loss = ((y_pred - y_norm)**2).sum()                # SSR
+        y_pred = model(x_t)
+        loss = ((y_pred - y_norm) ** 2).sum()
 
         if reg_lambda > 0:
-            theta_batch = model.lb + (model.ub - model.lb) * torch.sigmoid(model.raw)  # (B,13)
+            theta_batch = model.lb + (model.ub - model.lb) * torch.sigmoid(model.raw)
             phi_batch = theta_to_phi(theta_batch, pixel_size, i0)
             eps_div = 1e-12
 
-            pen1  = (phi_batch[:, 12] - phi_init_torch[12])**2
-            pen2  = (phi_batch[:, 2] + phi_batch[:, 12] - (phi_init_torch[2] + phi_init_torch[12]))**2
-            pen3  = (phi_batch[:, 5] + phi_batch[:, 12] - (phi_init_torch[5] + phi_init_torch[12]))**2
-            pen4  = (phi_batch[:, 2] - phi_batch[:, 5])**2
-            pen5  = (phi_batch[:, 1] - phi_batch[:, 4])**2
-            pen6  = (((phi_batch[:, 0] + phi_batch[:, 3]) * 0.5) - ((phi_init_torch[0] + phi_init_torch[3]) * 0.5))**2
-            pen7  = ((phi_batch[:, 8] / (phi_batch[:, 2] + eps_div)) - (phi_init_torch[8] / (phi_init_torch[2] + eps_div)))**2
-            pen8  = ((phi_batch[:, 11] / (phi_batch[:, 5] + eps_div)) - (phi_init_torch[11] / (phi_init_torch[5] + eps_div)))**2
-            pen9  = ((phi_batch[:, 7] / (phi_batch[:, 1] + eps_div)) - (phi_init_torch[7] / (phi_init_torch[1] + eps_div)))**2
-            pen10 = ((phi_batch[:, 10] / (phi_batch[:, 4] + eps_div)) - (phi_init_torch[10] / (phi_init_torch[4] + eps_div)))**2
+            pen1  = (phi_batch[:, 12] - phi_init_torch[12]) ** 2
+            pen2  = (phi_batch[:, 2] + phi_batch[:, 12] - (phi_init_torch[2] + phi_init_torch[12])) ** 2
+            pen3  = (phi_batch[:, 5] + phi_batch[:, 12] - (phi_init_torch[5] + phi_init_torch[12])) ** 2
+            pen4  = (phi_batch[:, 2] - phi_batch[:, 5]) ** 2
+            pen5  = (phi_batch[:, 1] - phi_batch[:, 4]) ** 2
+            pen6  = (((phi_batch[:, 0] + phi_batch[:, 3]) * 0.5) - ((phi_init_torch[0] + phi_init_torch[3]) * 0.5)) ** 2
+            pen7  = ((phi_batch[:, 8] / (phi_batch[:, 2] + eps_div)) - (phi_init_torch[8] / (phi_init_torch[2] + eps_div))) ** 2
+            pen8  = ((phi_batch[:, 11] / (phi_batch[:, 5] + eps_div)) - (phi_init_torch[11] / (phi_init_torch[5] + eps_div))) ** 2
+            pen9  = ((phi_batch[:, 7] / (phi_batch[:, 1] + eps_div)) - (phi_init_torch[7] / (phi_init_torch[1] + eps_div))) ** 2
+            pen10 = ((phi_batch[:, 10] / (phi_batch[:, 4] + eps_div)) - (phi_init_torch[10] / (phi_init_torch[4] + eps_div))) ** 2
 
             denom11 = (phi_batch[:, 3] - phi_batch[:, 0]).clone()
             denom11 = torch.where(torch.abs(denom11) < eps_div, torch.full_like(denom11, eps_div), denom11)
             val11 = 2.0 * (phi_batch[:, 6] - phi_batch[:, 0]) / denom11
-            init_denom11 = (phi_init_torch[3] - phi_init_torch[0])
-            if abs(init_denom11) < eps_div:
-                init_denom11 = eps_div
-            init_val11 = 2.0 * (phi_init_torch[6] - phi_init_torch[0]) / init_denom11
-            pen11 = (val11 - init_val11)**2
+
+            init_denom11 = phi_init_torch[3] - phi_init_torch[0]
+            init_denom11_safe = torch.where(torch.abs(init_denom11) < eps_div, torch.tensor(eps_div, device=device, dtype=torch.double), init_denom11)
+            init_val11 = 2.0 * (phi_init_torch[6] - phi_init_torch[0]) / init_denom11_safe
+            pen11 = (val11 - init_val11) ** 2
 
             denom12 = (phi_batch[:, 3] - phi_batch[:, 0]).clone()
             denom12 = torch.where(torch.abs(denom12) < eps_div, torch.full_like(denom12, eps_div), denom12)
             val12 = 2.0 * (phi_batch[:, 3] - phi_batch[:, 9]) / denom12
-            init_denom12 = (phi_init_torch[3] - phi_init_torch[0])
-            if abs(init_denom12) < eps_div:
-                init_denom12 = eps_div
-            init_val12 = 2.0 * (phi_init_torch[3] - phi_init_torch[9]) / init_denom12
-            pen12 = (val12 - init_val12)**2
+
+            init_denom12 = phi_init_torch[3] - phi_init_torch[0]
+            init_denom12_safe = torch.where(torch.abs(init_denom12) < eps_div, torch.tensor(eps_div, device=device, dtype=torch.double), init_denom12)
+            init_val12 = 2.0 * (phi_init_torch[3] - phi_init_torch[9]) / init_denom12_safe
+            pen12 = (val12 - init_val12) ** 2
 
             penalty = (pen1 + pen2 + pen3 + pen4 + pen5 + pen6 +
                        pen7 + pen8 + pen9 + pen10 + pen11 + pen12).sum()
@@ -355,35 +352,33 @@ def fit_batch_profile_gpu(
 
     optimizer.step(closure)
 
-    # --- extract fitted raw params (same as original) ---
+    # Extract fitted raw parameters (logits)
     params = model.raw.detach().cpu().numpy()  # (B,13)
 
-    # --- compute residuals & ssr ---
+    # Compute residuals & SSR
     with torch.no_grad():
-        y_pred = model(x_t).cpu().numpy()           # (B,L)
-        resid = y_norm.cpu().numpy() - y_pred       # (B,L)
-        ssr = np.sum(resid**2, axis=1)              # (B,)
+        y_pred = model(x_t).cpu().numpy()
+        resid = y_norm.cpu().numpy() - y_pred
+        ssr = np.sum(resid ** 2, axis=1)
 
-    # compute N_eff
-    total_length = L * pixel_size
+    # Effective number of independent points
+    total_length = L * pixel_size  # in Å
     N_eff = total_length / corr_length
 
-    # --- covariance: per-profile JTJ + R (GN) and df_eff ---
+    # Covariance estimation
     covs = np.zeros((B, 13, 13), dtype=float)
     dof_array = np.zeros(B, dtype=float)
     for b in range(B):
-        raw_b = params[b]  # raw
+        raw_b = params[b]
         sig_b = 1.0 / (1.0 + np.exp(-raw_b))
-        theta_b = lb_abs + (ub_abs - lb_abs) * sig_b  # (13,)
+        theta_b = lb_abs + (ub_abs - lb_abs) * sig_b
+        phi_b = theta_to_phi(theta_b, pixel_size, i0)  # numpy (13,)
 
-        phi_b = theta_to_phi(theta_b, pixel_size, i0)  # (13,) numpy
-        
-        # Jacobian of model outputs wrt phi (L,13)
-        old_params_b = phi_b.tolist()
-        Jb = gaussian_quad_jac(np.arange(L), *old_params_b)  # (L,13)
+        # Jacobian of model outputs wrt phi
+        Jb = gaussian_quad_jac(np.arange(L), *phi_b)  # (L,13)
         JTJ = Jb.T @ Jb
 
-        # build R (Gauss-Newton)
+        # Regularisation Hessian
         R = build_R_GN(phi_b, reg_lambda)
 
         H = JTJ + R
@@ -392,13 +387,12 @@ def fit_batch_profile_gpu(
         except np.linalg.LinAlgError:
             invH = np.linalg.pinv(H)
 
-        # effective number of parameters
+        # Effective number of parameters
         df_eff = np.trace(invH @ JTJ)
-        #print(df_eff)
         dof_b = N_eff - df_eff
         if dof_b <= 0:
             dof_b = max(1.0, N_eff * 0.01)
-            print('dof < 0 !!!')
+            print('Warning: degrees of freedom <= 0; setting to', dof_b)
 
         covs[b] = invH * (ssr[b] / dof_b)
         dof_array[b] = float(dof_b)
@@ -407,7 +401,7 @@ def fit_batch_profile_gpu(
 
 
 class ThicknessCalculator:
-    """GPU‐accelerated core thickness computation, now with 4 Gaussians."""
+    """GPU‐accelerated core thickness computation using a 4‑Gaussian model."""
     def __init__(self,
                  volume: np.ndarray,
                  pixel_size: float,
@@ -421,25 +415,25 @@ class ThicknessCalculator:
         self.intensity_mask_2d: Optional[np.ndarray] = None
         self.fitting_mask: Optional[np.ndarray] = None
 
-        # computed fields
+        # Computed fields
         self.smoothed_volume: Optional[np.ndarray] = None
         self.width: Optional[np.ndarray] = None
         self.width_sigma: Optional[np.ndarray] = None
         self.loss: Optional[np.ndarray] = None
         self.template_map: Optional[np.ndarray] = None
 
-        # templates: list of (init_abs, lb_abs, ub_abs, (z_lo, z_hi)) in Å
+        # Templates: list of (init_abs, lb_abs, ub_abs, (z_lo, z_hi)) in Å
         self.fit_templates: List[Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[float, float]]] = []
 
-        self.theta_map: Optional[np.ndarray] = None   # will hold fitted θ in Å
+        self.theta_map: Optional[np.ndarray] = None   # stores fitted θ in Å
 
     def smooth(self, sigma_ang: float = 9.0) -> None:
         """Smooth each Z‐slice with a 2D Gaussian filter."""
         sigma_px = sigma_ang / self.pixel_size
         r = round(3 * sigma_px)
-        x = np.linspace(-r, r, 2*r+1)
+        x = np.linspace(-r, r, 2 * r + 1)
         X, Y = np.meshgrid(x, x)
-        kernel = np.exp(-(X**2 + Y**2) / (2 * sigma_px**2))
+        kernel = np.exp(-(X ** 2 + Y ** 2) / (2 * sigma_px ** 2))
         self.smoothed_volume = np.stack([
             fftconvolve(slice_, kernel, mode='same')
             for slice_ in self.volume
@@ -455,18 +449,19 @@ class ThicknessCalculator:
     def compute_thickness(self,
                           tol: float = 1e-3,
                           reg_lambda: float = 0.0,
-                          corr_length: float = 6/1.7741,
+                          corr_length: float = 6 / 1.7741,
                           max_rmse: float = 0.1,
                           amp_threshold: float = 0.05) -> None:
-        """Batched 4‑Gaussian fitting with the same error logic as before."""
+        """Batched 4‑Gaussian fitting with error checks."""
         assert self.smoothed_volume is not None, "Call smooth() first."
         mask = self._choose_mask()
         zdim, ydim, xdim = self.smoothed_volume.shape
 
+        # Initialize result arrays
         self.width        = np.full((ydim, xdim), np.nan)
         self.width_sigma  = np.full((ydim, xdim), np.nan)
         self.loss         = np.full((ydim, xdim), np.nan)
-        self.template_map = np.full((ydim, xdim),   np.nan)
+        self.template_map = np.full((ydim, xdim), np.nan)
         self.theta_map    = np.full((ydim, xdim, 13), np.nan)
 
         unassigned = np.ones((ydim, xdim), dtype=bool)
@@ -486,17 +481,16 @@ class ThicknessCalculator:
             if B == 0:
                 break
 
+            # Extract segments for all remaining pixels
             segments = np.zeros((B, L), dtype=float)
-            coords   = []
+            coords = []
             for idx, (y, x_) in enumerate(zip(ys, xs)):
                 segments[idx] = self.smoothed_volume[i0:i1, y, x_]
                 coords.append((y, x_))
 
             params_b, covs_b, ssr_b, dof_array = fit_batch_profile_gpu(
-                segments,
-                init_abs, lb_abs, ub_abs,
-                i0,
-                self.pixel_size,
+                segments, init_abs, lb_abs, ub_abs,
+                i0, self.pixel_size,
                 corr_length=corr_length,
                 reg_lambda=reg_lambda,
             )
@@ -505,24 +499,23 @@ class ThicknessCalculator:
                 p   = params_b[k]
                 cov = covs_b[k]
                 ssr = ssr_b[k]
-                theta = lb_abs + (ub_abs - lb_abs) * torch.sigmoid(torch.from_numpy(p).to('cpu')).detach().numpy()
+                # Convert raw logits to physical θ (absolute Å)
+                theta = lb_abs + (ub_abs - lb_abs) * torch.sigmoid(
+                    torch.from_numpy(p).to('cpu')
+                ).detach().numpy()
 
-                # start with per-profile dof
                 dof_k = float(dof_array[k])
 
-                tolmask = [0,1,2,3,4,5,6,7,8,9,10,11,12]
-                
-                if theta[10] < amp_threshold:
-                    #dof_k += 3
-                    #print('A3 is small')
-                    tolmask = [0,1,3,4,5,7,8,9,11,12]
-                if theta[11] < amp_threshold:
-                    #dof_k += 3
-                    #print('A4 is small')
-                    tolmask = [0,1,2,4,5,6,8,9,10,12]
+                # Determine which parameters to check for bound proximity
+                tolmask = list(range(13))
+                if theta[10] < amp_threshold:   # fA3 small
+                    tolmask = [0, 1, 3, 4, 5, 7, 8, 9, 11, 12]
+                if theta[11] < amp_threshold:   # fA4 small
+                    tolmask = [0, 1, 2, 4, 5, 6, 8, 9, 10, 12]
                 if theta[10] < amp_threshold and theta[11] < amp_threshold:
-                    tolmask = [0,1,4,5,8,9,12]
+                    tolmask = [0, 1, 4, 5, 8, 9, 12]
 
+                # Skip if any relevant parameter is near its bound
                 if (np.isclose(theta[tolmask], lb_abs[tolmask], rtol=tol).any() or
                     np.isclose(theta[tolmask], ub_abs[tolmask], rtol=tol).any()):
                     continue
@@ -531,12 +524,13 @@ class ThicknessCalculator:
                 if rmse > max_rmse:
                     continue
 
-                dz = theta[1] * 2
-                self.width[y, x_]       = abs(dz)
-                var                       = cov[0,0] + cov[3,3] - 2*cov[0,3]
-                self.width_sigma[y, x_]   = np.sqrt(max(var, 0)) * self.pixel_size
-                self.loss[y, x_]          = rmse
-                self.template_map[y, x_]  = t_idx
+                # Store results
+                self.width[y, x_]       = abs(theta[1] * 2)          # thickness = 2*d0
+                # Variance of (m2 - m1) from covariance (pixel units), converted to Å
+                var_px = cov[0, 0] + cov[3, 3] - 2 * cov[0, 3]
+                self.width_sigma[y, x_] = np.sqrt(max(var_px, 0)) * self.pixel_size
+                self.loss[y, x_]        = rmse
+                self.template_map[y, x_] = t_idx
                 self.theta_map[y, x_, :] = theta
 
                 unassigned[y, x_] = False
