@@ -1,10 +1,10 @@
-Computes nanodisk thickness from .mrc density maps. Nanodisk should be orthogonal to z-axis. Example workflow provided in jupyter notebook
+Computes nanodisk thickness from .mrc density map. Example workflow provided in jupyter notebook.
 
 ## Membrane Thickness Computation
 
-Density is aligned along the symmetry axis so that the membrane lies parallel to the XY plane. A tight mask is generated around the protein and density inside it is zeroed out to exclude the protein from subsequent analysis. To improve the signal‑to‑noise ratio, the density is smoothed in the XY direction to a 6 Å resolution – corresponding to the characteristic local resolution of the lipid bilayer – by convolution with a Gaussian kernel. Only regions with sufficient density in the membrane are selected for further processing.
+ Nanodisk should be orthogonal to Z-axis. To improve the signal‑to‑noise ratio, the density is smoothed in the XY-direction by convolution with a Gaussian kernel. Supports generaion of intensuty mask to select region with sufficiend density. Additionaly supports generation of 2D mask to exlude protein from external 3D mask.
 
-For each selected pixel, an intensity profile along the Z‑axis is extracted and fitted with a sum of four Gaussians plus a constant bias (13 parameters total). The fitting is performed using the L‑BFGS optimizer in PyTorch, batched over all pixels for efficiency.
+For each selected pixel in XY-plane, an intensity profile along the Z‑axis is extracted and fitted with a sum of four Gaussians plus a constant bias (13 parameters total). The fitting is performed using the L‑BFGS optimizer in PyTorch, batched over all pixels for efficiency.
 
 ### Parameterisation and bounds
 
@@ -20,10 +20,10 @@ The thirteen parameters, in order, are:
 
 | Index | Symbol      | Meaning                                     |
 |-------|-------------|---------------------------------------------|
-| 0     | $m_0$        | Centre of the two main Gaussians (Å)        |
-| 1     | $d_0$        | Half‑distance between main Gaussians (Å)    |
-| 2     | $d_1$        | Fraction of $d_0$ for satellite‑1 offset    |
-| 3     | $d_2$        | Fraction of $d_0$ for satellite‑2 offset    |
+| 0     | $m_0$        | Centre of the membrane (Å)        |
+| 1     | $d_0$        | Distance from center to outer peaks (Half of headgroup peak-peak distance) (Å)    |
+| 2     | $f_{d_1}$        | Fraction of $d_0$ for satellite‑1 offset    |
+| 3     | $f_{d_2}$        | Fraction of $d_0$ for satellite‑2 offset    |
 | 4     | $\sigma_1$   | Width of main Gaussian 1 (Å)                |
 | 5     | $\sigma_2$   | Width of main Gaussian 2 (Å)                |
 | 6     | $f_{\sigma_3}$ | Fraction of $\sigma_1$ for satellite 3   |
@@ -40,7 +40,7 @@ $$
 m_1 = m_0 - d_0, \quad m_2 = m_0 + d_0,
 $$
 $$
-m_3 = m_1 + d_1\cdot d_0, \quad m_4 = m_2 - d_2\cdot d_0,
+m_3 = m_1 + d_0\cdot f_{d_1}, \quad m_4 = m_2 - d_0\cdot f_{d_2},
 $$
 $$
 \sigma_3 = \sigma_1 \cdot f_{\sigma_3}, \quad \sigma_4 = \sigma_2 \cdot f_{\sigma_4},
@@ -53,7 +53,7 @@ All positions and widths are converted to pixel units relative to the profile st
 
 ### Regularization
 
-The four‑Gaussian model is intentionally over‑parameterised to accommodate a wide range of profile shapes, but this flexibility can cause numerical instability or unphysical fits when satellite peaks are weak or poorly resolved. To mitigate this, we add a quadratic regularization term that encourages the fitted profile to retain certain relationships observed in the best‑resolved regions. These relationships are expressed as twelve scalar functions $f_k(\boldsymbol{\phi})$ of the *pixel‑relative* parameters
+Four peaks in the density profile are only well resolved in a bulk of nanodisk. In regions where satellite peaks are weak or poorly resolved numerical instability or unphysical fits can arise. To mitigate this, we add a quadratic regularization term that encourages the fitted profile to retain certain relationships observed in the best‑resolved regions. These relationships are expressed as twelve scalar functions $f_k(\boldsymbol{\phi})$ of the *pixel‑relative* parameters
 
 $$
 \boldsymbol{\phi} = [m_1, \sigma_1, A_1, m_2, \sigma_2, A_2, m_3, \sigma_3, A_3, m_4, \sigma_4, A_4, b]^\top.
@@ -68,10 +68,10 @@ $$
 and the complete loss function becomes
 
 $$
-\mathcal{L} = \underbrace{\sum_{\text{pixels}} \left( y_{\text{data}} - y_{\text{model}}(\boldsymbol{\phi}) \right)^2}_{\text{SSR}} \;+\; \lambda \,\mathcal{R}(\boldsymbol{\phi}),
+\mathcal{L} = \sum_{\mathrm{pixels}} \left( y_{\mathrm{data}} - y_{\mathrm{model}}(\boldsymbol{\phi}) \right)^2 + \lambda \mathcal{R}(\boldsymbol{\phi}),
 $$
 
-where $\lambda$ is the user‑specified `reg_lambda`.
+where the first term is the sum of squared residuals (SSR), $\lambda$ is the user‑specified `reg_lambda`, and $\mathcal{R}(\boldsymbol{\phi})$ is the regularization penalty.
 
 The twelve constraints are summarised below:
 
@@ -82,7 +82,7 @@ The twelve constraints are summarised below:
 | 3 | $A_2 + b - (A_2^{(0)} + b^{(0)})$ | Stabilise sum of second amplitude and bias |
 | 4 | $A_1 - A_2$ | Encourage equal main amplitudes |
 | 5 | $\sigma_1 - \sigma_2$ | Encourage equal main widths |
-| 6 | $\frac{m_1 + m_2}{2} - \frac{m_1^{(0)} + m_2^{(0)}}{2}$ | Hold centre of main peaks near initial value |
+| 6 | $\frac{m_1 + m_2}{2} - \frac{m_1^{(0)} + m_2^{(0)}}{2}$ | Hold centre of membrane near initial value |
 | 7 | $\frac{A_3}{A_1} - \frac{A_3^{(0)}}{A_1^{(0)}}$ | Preserve amplitude ratio of satellite 3 |
 | 8 | $\frac{A_4}{A_2} - \frac{A_4^{(0)}}{A_2^{(0)}}$ | Preserve amplitude ratio of satellite 4 |
 | 9 | $\frac{\sigma_3}{\sigma_1} - \frac{\sigma_3^{(0)}}{\sigma_1^{(0)}}$ | Preserve width ratio of satellite 3 |
@@ -90,7 +90,7 @@ The twelve constraints are summarised below:
 | 11 | $\frac{2(m_3 - m_1)}{m_2 - m_1} - \frac{2(m_3^{(0)} - m_1^{(0)})}{m_2^{(0)} - m_1^{(0)}}$ | Keep relative position of satellite 3 |
 | 12 | $\frac{2(m_2 - m_4)}{m_2 - m_1} - \frac{2(m_2^{(0)} - m_4^{(0)})}{m_2^{(0)} - m_1^{(0)}}$ | Keep relative position of satellite 4 |
 
-The penalty functions are designed to be **scale‑invariant** where possible (ratios, normalised positions), making the regularization equally meaningful for profiles with different overall intensities or thicknesses.
+The penalty functions are designed to be **scale‑invariant** where possible (ratios, normalised positions), making the regularization equally meaningful for profiles with different overall intensities or thicknesses. Notably, none of regularisation terms actually constrains distance between main peaks, leaving measured membrane thickness mostly unaffected.
 
 During optimisation, the constraints are evaluated in PyTorch using the current $\boldsymbol{\phi}$ and the initial $\boldsymbol{\phi}^{(0)}$. For the error estimation (below), the Gauss‑Newton approximation of the regularisation Hessian is built analytically: each term contributes $2\,\lambda\,\nabla f_k \nabla f_k^\top$ to the matrix $R$.
 
@@ -125,15 +125,15 @@ with $\text{SSR}$ being the sum of squared residuals and $\text{dof}$ the effect
 The **effective number of independent data points** is calculated as
 
 $$
-N_{\text{eff}} = \frac{L \cdot s_{\text{px}}}{c},
+N_{\text{eff}} = \frac{L \cdot s_{\text{px}}}{l_{\text{corr}}},
 $$
 
-where $L$ is the number of pixels in the profile, `pixel_size` is the voxel size in Å, and `corr_length` is the correlation length corresponding to the 6 Å smoothing (here $6 / 1.7741$ Å).
+where $L$ is the number of pixels in the profile, s_{\text{px}} is the pixel size in Å, and l_{\text{corr}} is the correlation length corresponding to the local resolution of the nanodisk (here $6 / 1.7741$ Å).
 
 The effective number of parameters is
 
 $$
-p_{\text{eff}} = \mathrm{trace}\!\left( H^{-1} J^\top J \right),
+p_{\text{eff}} = \mathrm{trace}\left( H^{-1} J^\top J \right),
 $$
 
 and the degrees of freedom are
@@ -142,6 +142,4 @@ $$
 \text{dof} = N_{\text{eff}} - p_{\text{eff}}.
 $$
 
-If `dof` becomes non‑positive, it is clamped to a small positive value to avoid division by zero.
-
-This framework provides a robust, quantitative estimate of the membrane thickness and its uncertainty for every pixel in the map.
+This framework provides a robust, quantitative estimate of the membrane thickness and its uncertainty at every point of the nanodisk.
