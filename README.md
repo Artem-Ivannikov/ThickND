@@ -133,7 +133,7 @@ where $L$ is the number of pixels in the profile, `pixel_size` is the voxel size
 The effective number of parameters is
 
 $$
-p_{\text{eff}} = \operatorname{trace}\!\left( H^{-1} J^\top J \right),
+p_{\text{eff}} = \mathrm{trace}\!\left( H^{-1} J^\top J \right),
 $$
 
 and the degrees of freedom are
