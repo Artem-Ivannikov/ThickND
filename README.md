@@ -125,13 +125,15 @@ with $\text{SSR}$ being the sum of squared residuals and $\text{dof}$ the effect
 The **effective number of independent data points** is calculated as
 
 $$
-N_{\text{eff}} = \frac{L \cdot \text{pixel\_size}}{\text{corr\_length}},
+N_{\text{eff}} = \frac{L \cdot s_{\text{px}}}{c},
 $$
 
-where $L$ is the number of pixels in the profile and `corr_length` is the correlation length corresponding to the 6 Å smoothing (here $6 / 1.7741$ Å). The effective number of parameters is
+where $L$ is the number of pixels in the profile, `pixel_size` is the voxel size in Å, and `corr_length` is the correlation length corresponding to the 6 Å smoothing (here $6 / 1.7741$ Å).
+
+The effective number of parameters is
 
 $$
-p_{\text{eff}} = \text{trace}\!\left( H^{-1} J^\top J \right),
+p_{\text{eff}} = \operatorname{trace}\!\left( H^{-1} J^\top J \right),
 $$
 
 and the degrees of freedom are
